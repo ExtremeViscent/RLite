@@ -1,0 +1,6 @@
+[submodule "third-party/Megatron-LM"]
+	path = third-party/Megatron-LM
+	url = https://github.com/NVIDIA/Megatron-LM.git
+[submodule "third-party/sglang"]
+	path = third-party/sglang
+	url = https://github.com/sgl-project/sglang.git
