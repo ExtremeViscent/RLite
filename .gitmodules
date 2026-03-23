@@ -7,3 +7,9 @@
 [submodule "third-party/transformers"]
 	path = third-party/transformers
 	url = https://github.com/huggingface/transformers.git
+[submodule "third-party/libfabric"]
+	path = third-party/libfabric
+	url = https://github.com/ofiwg/libfabric.git
+[submodule "third-party/gdrcopy"]
+	path = third-party/gdrcopy
+	url = https://github.com/NVIDIA/gdrcopy.git
