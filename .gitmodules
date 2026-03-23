@@ -4,3 +4,6 @@
 [submodule "third-party/sglang"]
 	path = third-party/sglang
 	url = https://github.com/sgl-project/sglang.git
+[submodule "third-party/transformers"]
+	path = third-party/transformers
+	url = https://github.com/huggingface/transformers.git
