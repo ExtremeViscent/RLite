@@ -1,5 +1,9 @@
 # RLite
 
+<p align="center">
+  <img src="docs/images/rlite-banner.png" alt="RLite logo and banner" width="900">
+</p>
+
 Lightweight infrastructure for cross-framework LLM weight exchange in reinforcement learning workflows.
 
 RLite enables Megatron, native `transformers` + FSDP, and SGLang workers to exchange weights and operate together in one RL workflow without requiring a single monolithic runtime.
