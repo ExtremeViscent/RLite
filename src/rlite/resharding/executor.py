@@ -173,6 +173,8 @@ def _materialize_binding(
     as_target: bool,
 ) -> TensorBinding:
     if manifest.binding_kind is BindingKind.DIRECT:
+        if record.linear_segments:
+            return TensorBinding(manifest=manifest, buffer=record.tensor)
         if manifest.component_start == 0 and manifest.component_end == len(record.canonical_names):
             buffer = record.tensor
         elif record.packing.axis == 0:

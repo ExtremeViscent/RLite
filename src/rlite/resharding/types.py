@@ -47,11 +47,81 @@ class LocalityTier(str, Enum):
 SliceTuple = tuple[tuple[int, int], ...]
 
 
+@dataclass(frozen=True)
+class LinearSegment:
+    """A contiguous logical interval mapped onto a byte range in local storage."""
+
+    logical_start: int
+    logical_stop: int
+    byte_offset: int
+    byte_length: int
+
+    def __post_init__(self) -> None:
+        if self.logical_start < 0 or self.logical_stop < self.logical_start:
+            raise ValueError("logical interval must be non-negative and ordered")
+        if self.byte_offset < 0 or self.byte_length < 0:
+            raise ValueError("storage byte ranges must be non-negative")
+
+    @property
+    def numel(self) -> int:
+        return self.logical_stop - self.logical_start
+
+
 def _shape_product(shape: tuple[int, ...]) -> int:
     product = 1
     for dim in shape:
         product *= int(dim)
     return product
+
+
+def _dense_linear_segments(
+    logical_shape: tuple[int, ...],
+    local_shape: tuple[int, ...],
+    logical_slices: SliceTuple,
+    shard_axis: int | None,
+    item_size: int,
+) -> tuple[LinearSegment, ...]:
+    if not logical_shape:
+        return ()
+
+    if shard_axis is None:
+        numel = _shape_product(local_shape)
+        return (
+            LinearSegment(
+                logical_start=0,
+                logical_stop=numel,
+                byte_offset=0,
+                byte_length=numel * item_size,
+            ),
+        )
+
+    prefix = 1
+    for dim in logical_shape[:shard_axis]:
+        prefix *= dim
+    suffix = 1
+    for dim in logical_shape[shard_axis + 1 :]:
+        suffix *= dim
+
+    logical_axis_start, logical_axis_stop = logical_slices[shard_axis]
+    local_axis_extent = max(0, logical_axis_stop - logical_axis_start)
+    byte_stride = local_axis_extent * suffix * item_size
+    full_axis_extent = logical_shape[shard_axis] * suffix
+    axis_logical_start = logical_axis_start * suffix
+    axis_numel = local_axis_extent * suffix
+
+    segments = []
+    for prefix_index in range(prefix):
+        logical_base = prefix_index * full_axis_extent
+        byte_base = prefix_index * byte_stride
+        segments.append(
+            LinearSegment(
+                logical_start=logical_base + axis_logical_start,
+                logical_stop=logical_base + axis_logical_start + axis_numel,
+                byte_offset=byte_base,
+                byte_length=axis_numel * item_size,
+            )
+        )
+    return tuple(segments)
 
 
 def _enum_value(value):
@@ -125,6 +195,7 @@ class ParameterRecord:
     memory_kind: MemoryKind | str
     component_logical_sizes: tuple[int, ...] = ()
     component_local_sizes: tuple[int, ...] = ()
+    linear_segments: tuple[LinearSegment, ...] = ()
     transpose: bool = False
     reshape: tuple[int, ...] | None = None
     match_groups: Mapping[str, str] = field(default_factory=dict)
@@ -138,6 +209,10 @@ class ParameterRecord:
         self.canonical_names = tuple(str(value) for value in self.canonical_names)
         self.component_logical_sizes = tuple(int(value) for value in self.component_logical_sizes)
         self.component_local_sizes = tuple(int(value) for value in self.component_local_sizes)
+        self.linear_segments = tuple(
+            value if isinstance(value, LinearSegment) else LinearSegment(*value)
+            for value in self.linear_segments
+        )
         self.match_groups = dict(self.match_groups)
         self.metadata = dict(self.metadata)
         if not self.actual_shape:
@@ -195,6 +270,7 @@ class TensorBindingManifest:
     logical_shape: tuple[int, ...]
     local_shape: tuple[int, ...]
     logical_slices: SliceTuple
+    linear_segments: tuple[LinearSegment, ...] = ()
     component_start: int = 0
     component_end: int = 0
     shard_axis: int | None = None
@@ -211,10 +287,30 @@ class TensorBindingManifest:
             "logical_slices",
             tuple((int(start), int(stop)) for start, stop in self.logical_slices),
         )
+        object.__setattr__(
+            self,
+            "linear_segments",
+            tuple(
+                value if isinstance(value, LinearSegment) else LinearSegment(*value)
+                for value in self.linear_segments
+            ),
+        )
         object.__setattr__(self, "canonical_names", tuple(self.canonical_names))
         object.__setattr__(self, "metadata", dict(self.metadata))
         if self.component_end <= 0:
             object.__setattr__(self, "component_end", len(self.canonical_names))
+        if not self.linear_segments:
+            object.__setattr__(
+                self,
+                "linear_segments",
+                _dense_linear_segments(
+                    self.logical_shape,
+                    self.local_shape,
+                    self.logical_slices,
+                    self.shard_axis,
+                    self.item_size,
+                ),
+            )
         if self.preferred_path is not None:
             object.__setattr__(
                 self,

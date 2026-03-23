@@ -22,6 +22,7 @@ from .types import (
     ExecutionSlice,
     FrameworkRole,
     FrameworkSnapshot,
+    LinearSegment,
     LocalityTier,
     ParameterRecord,
     PendingReceive,
@@ -44,6 +45,14 @@ def collect_sglang_snapshot(*args, **kwargs):
     return _collect_sglang_snapshot(*args, **kwargs)
 
 
+def collect_transformers_fsdp_snapshot(*args, **kwargs):
+    from ..integrations.transformers import (
+        collect_transformers_fsdp_snapshot as _collect_transformers_fsdp_snapshot,
+    )
+
+    return _collect_transformers_fsdp_snapshot(*args, **kwargs)
+
+
 __all__ = [
     "BindingKind",
     "ExchangeBundle",
@@ -54,6 +63,7 @@ __all__ = [
     "FrameworkSnapshot",
     "FrozenExchangeCoordinator",
     "InMemoryExchangeCoordinator",
+    "LinearSegment",
     "LocalityTier",
     "ParameterRecord",
     "PendingReceive",
@@ -66,6 +76,7 @@ __all__ = [
     "build_exchange_plan",
     "collect_megatron_snapshot",
     "collect_sglang_snapshot",
+    "collect_transformers_fsdp_snapshot",
     "commit_receive",
     "execute_exchange_plan",
     "frozen_coordinator_from_payload",

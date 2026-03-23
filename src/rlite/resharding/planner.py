@@ -17,6 +17,7 @@ from .types import (
     ExchangePlan,
     ExecutionSlice,
     FrameworkSnapshot,
+    LinearSegment,
     LocalityTier,
     ParameterRecord,
     TensorBindingManifest,
@@ -44,32 +45,52 @@ def _exchange_key(canonical_names: Sequence[str]) -> str:
     return f"rlite_{first}_{digest}"
 
 
-def _byte_segments(
-    shape: tuple[int, ...],
-    shard_axis: int | None,
-    start: int,
-    length: int,
-    item_size: int,
-) -> tuple[tuple[int, int], ...]:
-    if length <= 0:
+def _merge_intervals(intervals: Iterable[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
+    ordered = sorted((int(start), int(stop)) for start, stop in intervals if int(stop) > int(start))
+    if not ordered:
         return ()
-    if shard_axis is None:
-        total = item_size
-        for dim in shape:
-            total *= dim
-        return ((0, total),)
 
-    prefix = 1
-    for dim in shape[:shard_axis]:
-        prefix *= dim
-    suffix = 1
-    for dim in shape[shard_axis + 1 :]:
-        suffix *= dim
+    merged = [ordered[0]]
+    for start, stop in ordered[1:]:
+        prev_start, prev_stop = merged[-1]
+        if start <= prev_stop:
+            merged[-1] = (prev_start, max(prev_stop, stop))
+        else:
+            merged.append((start, stop))
+    return tuple(merged)
 
-    stride = shape[shard_axis] * suffix * item_size
-    segment = length * suffix * item_size
-    axis_offset = start * suffix * item_size
-    return tuple((prefix_index * stride + axis_offset, segment) for prefix_index in range(prefix))
+
+def _intersect_intervals(
+    left: Iterable[tuple[int, int]],
+    right: Iterable[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
+    intersections = []
+    for left_start, left_stop in left:
+        for right_start, right_stop in right:
+            start = max(left_start, right_start)
+            stop = min(left_stop, right_stop)
+            if stop > start:
+                intersections.append((start, stop))
+    return _merge_intervals(intersections)
+
+
+def _subtract_covered_intervals(
+    uncovered: Iterable[tuple[int, int]],
+    covered: Iterable[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
+    remaining = list(_merge_intervals(uncovered))
+    for covered_start, covered_stop in _merge_intervals(covered):
+        updated: list[tuple[int, int]] = []
+        for start, stop in remaining:
+            if covered_stop <= start or stop <= covered_start:
+                updated.append((start, stop))
+                continue
+            if start < covered_start:
+                updated.append((start, covered_start))
+            if covered_stop < stop:
+                updated.append((covered_stop, stop))
+        remaining = updated
+    return tuple(remaining)
 
 
 def _shard_slices_for_endpoint(
@@ -184,6 +205,77 @@ def _component_sizes_for_record(record: ParameterRecord) -> tuple[int, ...]:
         return (record.local_shape[axis],)
     raise ValueError(
         f"Record {record.record_id!r} does not expose component sizes for packed materialization."
+    )
+
+
+def _component_logical_sizes_for_record(record: ParameterRecord) -> tuple[int, ...]:
+    if record.component_logical_sizes:
+        return record.component_logical_sizes
+    if len(record.canonical_names) == 1:
+        return (_shape_product(record.logical_shape),)
+    raise ValueError(
+        f"Record {record.record_id!r} does not expose component logical sizes for packed materialization."
+    )
+
+
+def _canonical_flattened_intervals(record: ParameterRecord) -> tuple[tuple[tuple[int, int], ...], ...]:
+    if len(record.canonical_names) == 1:
+        total = _shape_product(record.logical_shape)
+        return (((0, total),),)
+
+    if record.packing.axis is None:
+        raise ValueError(
+            f"Record {record.record_id!r} has multiple canonicals but no packing axis."
+        )
+
+    axis = record.packing.axis
+    component_sizes = _component_logical_sizes_for_record(record)
+    prefix = math.prod(record.logical_shape[:axis]) if axis > 0 else 1
+    suffix = math.prod(record.logical_shape[axis + 1 :]) if axis + 1 < len(record.logical_shape) else 1
+    full_axis_extent = record.logical_shape[axis] * suffix
+
+    intervals = []
+    cursor = 0
+    for size in component_sizes:
+        component_intervals = []
+        component_extent = size * suffix
+        for prefix_index in range(prefix):
+            base = prefix_index * full_axis_extent
+            start = base + cursor * suffix
+            component_intervals.append((start, start + component_extent))
+        intervals.append(tuple(component_intervals))
+        cursor += size
+    return tuple(intervals)
+
+
+def _clip_linear_segments(
+    segments: Sequence[LinearSegment],
+    intervals: Iterable[tuple[int, int]],
+    item_size: int,
+) -> tuple[LinearSegment, ...]:
+    clipped = []
+    for segment in segments:
+        for start, stop in intervals:
+            overlap_start = max(segment.logical_start, start)
+            overlap_stop = min(segment.logical_stop, stop)
+            if overlap_stop <= overlap_start:
+                continue
+            byte_offset = segment.byte_offset + (overlap_start - segment.logical_start) * item_size
+            byte_length = (overlap_stop - overlap_start) * item_size
+            clipped.append(
+                LinearSegment(
+                    logical_start=overlap_start,
+                    logical_stop=overlap_stop,
+                    byte_offset=byte_offset,
+                    byte_length=byte_length,
+                )
+            )
+    return tuple(clipped)
+
+
+def _manifest_coverage(manifest: TensorBindingManifest) -> tuple[tuple[int, int], ...]:
+    return _merge_intervals(
+        (segment.logical_start, segment.logical_stop) for segment in manifest.linear_segments
     )
 
 
@@ -364,7 +456,8 @@ def build_binding_manifest(
             f"{canonical_names!r}."
         )
 
-    if len(canonical_names) == len(record.canonical_names):
+    full_unit = len(canonical_names) == len(record.canonical_names)
+    if full_unit:
         logical_shape = record.logical_shape
         local_shape = record.local_shape
     else:
@@ -373,28 +466,60 @@ def build_binding_manifest(
                 f"Record {record.record_id!r} has no packing axis for subset {canonical_names!r}."
             )
         axis = record.packing.axis
-        logical_dim = sum(record.component_logical_sizes[start:end])
-        local_dim = sum(record.component_local_sizes[start:end])
+        logical_dim = sum(_component_logical_sizes_for_record(record)[start:end])
         logical_shape = list(record.logical_shape)
-        local_shape = list(record.local_shape)
         logical_shape[axis] = logical_dim
-        local_shape[axis] = local_dim
         logical_shape = tuple(logical_shape)
-        local_shape = tuple(local_shape)
+        if record.linear_segments:
+            component_intervals = _canonical_flattened_intervals(record)[start:end]
+            selected_intervals = _merge_intervals(
+                interval
+                for component in component_intervals
+                for interval in component
+            )
+            selected_segments = _clip_linear_segments(record.linear_segments, selected_intervals, record.item_size)
+            if not selected_segments:
+                raise ValueError(
+                    f"Record {record.record_id!r} has no local storage coverage for canonical bundle "
+                    f"{canonical_names!r}."
+                )
+            subset_numel = sum(segment.numel for segment in selected_segments)
+            local_shape = (subset_numel,)
+        else:
+            local_dim = sum(_component_sizes_for_record(record)[start:end])
+            local_shape = list(record.local_shape)
+            local_shape[axis] = local_dim
+            local_shape = tuple(local_shape)
 
-    is_moe_sharded = record.parallel.kind.value.startswith("tp_ep")
-    logical_slices = _shard_slices_for_endpoint(
-        endpoint,
-        logical_shape,
-        local_shape,
-        record.parallel.shard_axis,
-        is_moe_sharded=is_moe_sharded,
-    )
     direct_subset = (
-        len(canonical_names) == len(record.canonical_names)
+        full_unit
         or record.packing.axis in (None, 0)
     )
     binding_kind = BindingKind.DIRECT if direct_subset and not (record.transpose or record.reshape) else BindingKind.STAGED
+    if record.linear_segments and binding_kind is BindingKind.DIRECT:
+        if full_unit:
+            linear_segments = record.linear_segments
+        else:
+            component_intervals = _canonical_flattened_intervals(record)[start:end]
+            selected_intervals = _merge_intervals(
+                interval
+                for component in component_intervals
+                for interval in component
+            )
+            linear_segments = _clip_linear_segments(record.linear_segments, selected_intervals, record.item_size)
+        logical_slices = tuple((0, dim) for dim in logical_shape)
+        shard_axis = None
+    else:
+        is_moe_sharded = record.parallel.kind.value.startswith("tp_ep")
+        logical_slices = _shard_slices_for_endpoint(
+            endpoint,
+            logical_shape,
+            local_shape,
+            record.parallel.shard_axis,
+            is_moe_sharded=is_moe_sharded,
+        )
+        linear_segments = ()
+        shard_axis = record.parallel.shard_axis
     return TensorBindingManifest(
         binding_id=f"{endpoint.rank}:{record.record_id}:{start}:{end}",
         record_id=record.record_id,
@@ -409,9 +534,10 @@ def build_binding_manifest(
         logical_shape=logical_shape,
         local_shape=local_shape,
         logical_slices=logical_slices,
+        linear_segments=linear_segments,
         component_start=start,
         component_end=end,
-        shard_axis=record.parallel.shard_axis,
+        shard_axis=shard_axis,
         metadata={
             **record.metadata,
             "tensor_role": record.tensor_role,
@@ -440,8 +566,13 @@ def _collect_manifest_candidates(
             full_units[full_manifest.canonical_names].append(full_manifest)
             if len(record.canonical_names) > 1:
                 for canonical in record.canonical_names:
-                    singleton = build_binding_manifest(record, snapshot.endpoint, (canonical,))
-                    singleton_units[canonical].append(singleton)
+                    try:
+                        singleton = build_binding_manifest(record, snapshot.endpoint, (canonical,))
+                    except ValueError as exc:
+                        if "no local storage coverage" not in str(exc):
+                            raise
+                    else:
+                        singleton_units[canonical].append(singleton)
             else:
                 singleton_units[record.canonical_names[0]].append(full_manifest)
     return full_units, singleton_units, records_by_id, endpoints_by_rank
@@ -513,23 +644,6 @@ def _choose_source_manifest(
     return best_source, best_decision, best_transfer_bytes
 
 
-def _subtract_interval(
-    uncovered: list[tuple[int, int]],
-    covered: tuple[int, int],
-) -> list[tuple[int, int]]:
-    covered_start, covered_stop = covered
-    remaining: list[tuple[int, int]] = []
-    for start, stop in uncovered:
-        if covered_stop <= start or stop <= covered_start:
-            remaining.append((start, stop))
-            continue
-        if start < covered_start:
-            remaining.append((start, covered_start))
-        if covered_stop < stop:
-            remaining.append((covered_stop, stop))
-    return remaining
-
-
 def _select_source_manifests(
     sources: Sequence[TensorBindingManifest],
     target: TensorBindingManifest,
@@ -541,27 +655,11 @@ def _select_source_manifests(
     if not sources:
         raise ValueError(f"No source candidates available for {target.canonical_names!r}.")
 
-    axis = None
-    for source in sources:
-        axis = source.shard_axis if source.shard_axis is not None else target.shard_axis
-        if axis is not None:
-            break
+    uncovered = list(_manifest_coverage(target))
+    if not uncovered:
+        return ((), 0)
 
-    if axis is None:
-        source, decision, _ = _choose_source_manifest(
-            sources,
-            target,
-            source_load_bytes,
-            source_endpoints,
-            target_endpoints,
-            policy,
-        )
-        tasks = _build_transfer_tasks(source, target, decision.preferred_path)
-        return (((source, decision, tasks),), sum(task.num_bytes for task in tasks))
-
-    target_slice = target.logical_slices[axis]
-    uncovered = [target_slice]
-    selected: list[tuple[TensorBindingManifest, TopologyDecision, tuple[TransferTask, ...], tuple[int, int]]] = []
+    selected: list[tuple[TensorBindingManifest, TopologyDecision, tuple[TransferTask, ...], tuple[tuple[int, int], ...]]] = []
     remaining = list(sources)
     total_bytes = 0
 
@@ -570,15 +668,10 @@ def _select_source_manifests(
         best_score = None
         best_bytes = 0
         for source in remaining:
-            overlap = _overlap_on_axis(source, target, axis)
-            if overlap is None:
-                continue
-            overlap_start, overlap_stop = overlap
-            uncovered_bytes = sum(
-                max(0, min(stop, overlap_stop) - max(start, overlap_start))
-                for start, stop in uncovered
-            )
-            if uncovered_bytes <= 0:
+            source_coverage = _manifest_coverage(source)
+            overlap = _intersect_intervals(source_coverage, uncovered)
+            overlap_elems = sum(stop - start for start, stop in overlap)
+            if overlap_elems <= 0:
                 continue
 
             source_endpoint = source_endpoints[source.rank]
@@ -603,7 +696,7 @@ def _select_source_manifests(
                     target_endpoint,
                     policy,
                 ),
-                -uncovered_bytes,
+                -overlap_elems,
             )
             decision = TopologyDecision(
                 src_rank=source.rank,
@@ -626,12 +719,12 @@ def _select_source_manifests(
 
         if best is None:
             raise ValueError(
-                f"Could not cover target logical slice {target_slice} for {target.canonical_names!r} "
+                f"Could not cover target logical intervals {tuple(uncovered)} for {target.canonical_names!r} "
                 f"with source candidates on rank {target.rank}."
             )
         selected.append(best)
         remaining = [source for source in remaining if source.binding_id != best[0].binding_id]
-        uncovered = _subtract_interval(uncovered, best[3])
+        uncovered = list(_subtract_covered_intervals(uncovered, best[3]))
         total_bytes += best_bytes
 
     return (
@@ -640,117 +733,44 @@ def _select_source_manifests(
     )
 
 
-def _overlap_on_axis(
-    source: TensorBindingManifest,
-    target: TensorBindingManifest,
-    axis: int,
-) -> tuple[int, int] | None:
-    if source.logical_shape != target.logical_shape:
-        raise ValueError(
-            f"Logical shape mismatch for exchange key {source.exchange_key!r}: "
-            f"{source.logical_shape} vs {target.logical_shape}."
-        )
-    if axis < 0 or axis >= len(source.logical_slices):
-        raise IndexError(f"Invalid shard axis {axis} for {source.exchange_key!r}.")
-    for index, (src_slice, dst_slice) in enumerate(zip(source.logical_slices, target.logical_slices)):
-        src_start, src_stop = src_slice
-        dst_start, dst_stop = dst_slice
-        start = max(src_start, dst_start)
-        stop = min(src_stop, dst_stop)
-        if start >= stop:
-            return None
-        if index != axis and ((start, stop) != src_slice or (start, stop) != dst_slice):
-            raise NotImplementedError(
-                "Multi-axis resharding overlaps are not supported by the current byte planner: "
-                f"{source.exchange_key!r} differs on axis {index} as well as shard axis {axis}."
-            )
-    src_start, src_stop = source.logical_slices[axis]
-    dst_start, dst_stop = target.logical_slices[axis]
-    start = max(src_start, dst_start)
-    stop = min(src_stop, dst_stop)
-    if start >= stop:
-        return None
-    return (start, stop)
-
-
 def _build_transfer_tasks(
     source: TensorBindingManifest,
     target: TensorBindingManifest,
     preferred_path: TransferPath,
 ) -> tuple[TransferTask, ...]:
-    axis = source.shard_axis if source.shard_axis is not None else target.shard_axis
-    if (
-        source.shard_axis is not None
-        and target.shard_axis is not None
-        and source.shard_axis != target.shard_axis
-    ):
-        raise NotImplementedError(
-            f"Resharding between different shard axes is not supported for {source.exchange_key!r}: "
-            f"{source.shard_axis} vs {target.shard_axis}."
-        )
-    if axis is None:
-        length = source.num_bytes
-        return (
-            TransferTask(
-                tensor_name=source.exchange_key,
-                src_rank=source.rank,
-                dst_rank=target.rank,
-                src_slice=(0, length),
-                dst_slice=(0, length),
-                dtype=source.dtype,
-                num_bytes=length,
-                src_mem_kind=source.memory_kind,
-                dst_mem_kind=target.memory_kind,
-                preferred_path=preferred_path,
-            ),
-        )
-
-    overlap = _overlap_on_axis(source, target, axis)
-    if overlap is None:
-        return ()
-    overlap_start, overlap_stop = overlap
-    src_axis_start = overlap_start - source.logical_slices[axis][0]
-    dst_axis_start = overlap_start - target.logical_slices[axis][0]
-    segment_bytes = _byte_segments(
-        source.local_shape,
-        axis,
-        src_axis_start,
-        overlap_stop - overlap_start,
-        source.item_size,
-    )
-    dst_segments = _byte_segments(
-        target.local_shape,
-        axis,
-        dst_axis_start,
-        overlap_stop - overlap_start,
-        target.item_size,
-    )
-    if len(segment_bytes) != len(dst_segments):
-        raise RuntimeError(
-            f"Segment count mismatch for exchange key {source.exchange_key!r}: "
-            f"{len(segment_bytes)} vs {len(dst_segments)}."
+    if source.logical_shape != target.logical_shape:
+        raise ValueError(
+            f"Logical shape mismatch for exchange key {source.exchange_key!r}: "
+            f"{source.logical_shape} vs {target.logical_shape}."
         )
     tasks = []
-    for (src_offset, length), (dst_offset, dst_length) in zip(segment_bytes, dst_segments):
-        if length != dst_length:
-            raise RuntimeError(
-                f"Byte-length mismatch for exchange key {source.exchange_key!r}: "
-                f"{length} vs {dst_length}."
+    for source_segment in source.linear_segments:
+        for target_segment in target.linear_segments:
+            overlap_start = max(source_segment.logical_start, target_segment.logical_start)
+            overlap_stop = min(source_segment.logical_stop, target_segment.logical_stop)
+            if overlap_stop <= overlap_start:
+                continue
+            byte_length = (overlap_stop - overlap_start) * source.item_size
+            src_offset = source_segment.byte_offset + (
+                overlap_start - source_segment.logical_start
+            ) * source.item_size
+            dst_offset = target_segment.byte_offset + (
+                overlap_start - target_segment.logical_start
+            ) * target.item_size
+            tasks.append(
+                TransferTask(
+                    tensor_name=source.exchange_key,
+                    src_rank=source.rank,
+                    dst_rank=target.rank,
+                    src_slice=(src_offset, byte_length),
+                    dst_slice=(dst_offset, byte_length),
+                    dtype=source.dtype,
+                    num_bytes=byte_length,
+                    src_mem_kind=source.memory_kind,
+                    dst_mem_kind=target.memory_kind,
+                    preferred_path=preferred_path,
+                )
             )
-        tasks.append(
-            TransferTask(
-                tensor_name=source.exchange_key,
-                src_rank=source.rank,
-                dst_rank=target.rank,
-                src_slice=(src_offset, length),
-                dst_slice=(dst_offset, length),
-                dtype=source.dtype,
-                num_bytes=length,
-                src_mem_kind=source.memory_kind,
-                dst_mem_kind=target.memory_kind,
-                preferred_path=preferred_path,
-            )
-        )
     return tuple(tasks)
 
 

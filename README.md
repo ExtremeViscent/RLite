@@ -8,12 +8,12 @@ Today, many RL stacks such as OpenRLHF, veRL, or slime solve rollout/training co
 
 RLite is **anti-intrusive by design**:
 
-- keep Megatron and SGLang as close to upstream as possible
+- keep Megatron, native `transformers` + FSDP, and SGLang as close to upstream as possible
 - carry framework hooks as small out-of-tree patches instead of permanent forks
 - treat weight exchange as a standalone systems problem
 - let RL researchers bring their own trainer logic, reward model, and data loop
 
-If Megatron is the fastest way to train and SGLang is the fastest way to serve rollouts, you should be able to use both together without inheriting a monolithic framework.
+If Megatron is the fastest way to train, native `transformers` + FSDP is the easiest way to prototype, and SGLang is the fastest way to serve rollouts, you should be able to mix them without inheriting a monolithic framework.
 
 ## Why This Project Exists
 
@@ -38,12 +38,13 @@ RLite is the bridge layer, not the whole kingdom.
 
 ## What RLite Is
 
-RLite is a small systems layer that helps a local Megatron training script and a remote SGLang rollout service behave like one RL stack.
+RLite is a small systems layer for cross-framework LLM weight exchange. It lets local or remote Megatron, native `transformers` + FSDP, and SGLang workers behave like one RL stack without forcing them into one runtime.
 
 It provides:
 
 - canonical weight mapping between `Megatron`, `Transformers`, and `SGLang`
 - topology-aware planning for cross-framework resharding
+- interval-backed logical coverage so TP shards, flat FSDP shards, and DTensor shards can share one planner
 - an explicit receive lifecycle for zero-copy or minimal-copy weight updates
 - a transport abstraction for direct tensor movement
 - thin framework integrations instead of a monolithic RL runtime
@@ -74,14 +75,20 @@ Current functionality in this repo includes:
 
 - weight mapping for `Qwen`, `GLM`, `LLaMA`, `GPT`, and `DeepSeek`
 - Megatron-side snapshot collection and receive hooks
+- native `transformers` + FSDP snapshot collection and receive hooks
 - SGLang-side snapshot collection and receive hooks
 - topology-aware exchange planning, including fan-in cases like `tp4 -> tp2+dp2`
+- interval-backed transfer planning across row shards, column shards, flat FSDP1 shards, and DTensor-style FSDP2 shards
 - explicit receive lifecycle:
   - `prepare_receive(...)`
   - `commit_receive(...)`
   - `abort_receive(...)`
 - direct bindings for live tensors and direct `narrow()` views
 - staged fallback with **per-parameter** ping-pong buffers, not a second full model image
+- shard-native FSDP support without `summon_full_params()` or full-state-dict gathering:
+  - FSDP1 via `FullyShardedDataParallel(..., use_orig_params=True)`
+  - FSDP2 via default single-mesh-dimension `fully_shard(..., placements=[Shard(0)])`
+- explicit fail-fast boundaries for layouts that would require a hidden gather, including unsupported transpose/reshape shard-local rules and grouped-expert flat-shard tensors without per-expert shard metadata
 - a TinyZero-style countdown example for:
   - local Megatron actor update
   - remote SGLang rollout over HTTP
@@ -115,7 +122,7 @@ The point is to make algorithm work easy, not to force everyone into one trainer
 
 ## How It Works
 
-RLite breaks Megatron <-> SGLang weight exchange into a few explicit steps.
+RLite breaks cross-framework weight exchange into a few explicit steps.
 
 ### 1. Canonical mapping
 
@@ -126,6 +133,7 @@ Examples:
 - fused QKV in Megatron -> split or fused attention weights in other frameworks
 - grouped expert tensors -> per-expert canonical units
 - TP-sharded local views -> logical global tensor regions
+- flat-parameter FSDP shards and DTensor shards -> logical linear intervals backed by local storage segments
 
 ### 2. Planning
 
@@ -142,6 +150,8 @@ It emits:
 - transfer tasks
 - expected source ranks for each target
 - direct vs staged binding metadata
+
+The planner works on logical interval overlap rather than only matching `shard_axis`, so Megatron, SGLang, FSDP1 flat shards, and FSDP2 per-parameter shards can participate in the same exchange core.
 
 ### 3. Receive preparation
 
@@ -177,12 +187,12 @@ For direct bindings, commit is effectively bookkeeping. For staged bindings, com
 
 ```mermaid
 flowchart LR
-    A["Megatron Trainer (local, tp4)"] --> B["RLite Mapping + Planner"]
-    B --> C["Receive/Transfer Protocol"]
-    C --> D["SGLang Rollout Server (remote, tp2+dp2)"]
-    D --> E["Rollout Responses + Logprobs"]
-    E --> A
-    A --> F["Megatron Actor Update"]
+    A["Megatron Trainer"] --> D["RLite Mapping + Interval Planner"]
+    B["Transformers + FSDP Trainer"] --> D
+    D --> E["Receive / Transfer Protocol"]
+    E --> C["SGLang Rollout Server"]
+    C --> F["Rollout Responses + Logprobs"]
+    F --> A
     F --> B
 ```
 
@@ -191,7 +201,7 @@ flowchart LR
 - [src/rlite/weight_mapping](/mnt/c/Users/zhang/RLite/src/rlite/weight_mapping): canonical name and shape mapping
 - [src/rlite/resharding](/mnt/c/Users/zhang/RLite/src/rlite/resharding): planning, execution, receive lifecycle
 - [src/rlite/transport](/mnt/c/Users/zhang/RLite/src/rlite/transport): transport contracts and backend integration
-- [src/rlite/integrations](/mnt/c/Users/zhang/RLite/src/rlite/integrations): Megatron and SGLang integration helpers
+- [src/rlite/integrations](/mnt/c/Users/zhang/RLite/src/rlite/integrations): Megatron, native `transformers` + FSDP, and SGLang integration helpers
 - [patches/sglang](/mnt/c/Users/zhang/RLite/patches/sglang): out-of-tree framework patches
 - [examples/tinyzero_countdown_remote.py](/mnt/c/Users/zhang/RLite/examples/tinyzero_countdown_remote.py): minimal TinyZero-style RL example
 
@@ -202,6 +212,7 @@ This repo intentionally keeps framework modifications out of the submodules them
 Today that means:
 
 - Megatron integration is handled from Python-side helpers in RLite
+- native `transformers` + FSDP integration is handled from Python-side helpers in RLite
 - SGLang integration is carried as thin patch files:
   - [0001-model-runner-rlite-hook.patch](/mnt/c/Users/zhang/RLite/patches/sglang/0001-model-runner-rlite-hook.patch)
   - [0002-http-server-rlite-receive-endpoints.patch](/mnt/c/Users/zhang/RLite/patches/sglang/0002-http-server-rlite-receive-endpoints.patch)
@@ -214,14 +225,16 @@ This makes it much easier to:
 
 ## Quickstart
 
-### 1. Clone and install
+### Megatron + Remote SGLang
+
+#### 1. Clone and install
 
 ```bash
 git submodule update --init --recursive
 python3 -m pip install -e .[dev]
 ```
 
-### 2. Apply the thin SGLang patches
+#### 2. Apply the thin SGLang patches
 
 If you are using the bundled SGLang submodule:
 
@@ -232,7 +245,7 @@ git -C third-party/sglang apply ../../patches/sglang/0002-http-server-rlite-rece
 
 If you are using your own SGLang checkout, apply the same patch files there instead.
 
-### 3. Start remote SGLang for rollout
+#### 3. Start remote SGLang for rollout
 
 RLite expects the remote rollout service to expose:
 
@@ -242,7 +255,7 @@ RLite expects the remote rollout service to expose:
   - `/rlite/commit_receive`
   - `/rlite/abort_receive`
 
-### 4. Keep Megatron local
+#### 4. Keep Megatron local
 
 Your training script owns:
 
@@ -253,7 +266,7 @@ Your training script owns:
 
 RLite only handles the bridge.
 
-### 5. Use the TinyZero-style demo loop
+#### 5. Use the TinyZero-style demo loop
 
 The countdown demo shows the intended split:
 
@@ -295,6 +308,34 @@ The example helper defaults to:
 - rollout profile: `Qwen2.5`, `tp2`
 - rollout topology: `tp2 + dp2` with remote rank offset `4`
 
+### Native Transformers + FSDP Helpers
+
+If you do not need the patched SGLang service path, RLite also exposes helper-only entry points for shard-native `transformers` + FSDP exchange:
+
+```python
+from rlite.integrations import (
+    abort_transformers_fsdp_receive,
+    collect_transformers_fsdp_snapshot,
+    commit_transformers_fsdp_receive,
+    execute_transformers_fsdp_exchange,
+    prepare_transformers_fsdp_receive,
+    synthesize_transformers_fsdp_target_snapshots,
+)
+```
+
+Use those helpers to:
+
+- collect shard-native source snapshots from a live FSDP model
+- synthesize shard-native target snapshots for a planned topology
+- prepare, commit, or abort receive state on the target side
+- execute one local execution slice against the generic transport layer
+
+Current shard-local support is intentionally narrow:
+
+- FSDP1 requires `use_orig_params=True`
+- FSDP2 supports only a single mesh dimension with the default `Shard(0)` placement in this first pass
+- layouts that would require a hidden full-parameter gather fail fast instead of silently gathering
+
 ## TinyZero-Style Example
 
 The example in [tinyzero_countdown_remote.py](/mnt/c/Users/zhang/RLite/examples/tinyzero_countdown_remote.py) intentionally stays small.
@@ -320,15 +361,19 @@ PYTHONPATH=src python3 -m pytest -q \
   tests/test_resharding_planner.py \
   tests/test_resharding_execution.py \
   tests/test_resharding_receive.py \
-  tests/test_resharding_integrations.py
+  tests/test_resharding_integrations.py \
+  tests/test_transformers_fsdp_integrations.py
 ```
 
 Those tests cover:
 
 - mapping coverage across major model families
 - direct vs staged receive behavior
-- planner metadata such as `requires_staging` and `fallback_bytes`
+- planner metadata such as `requires_staging`, `fallback_bytes`, and interval overlap coverage
 - `tp4 -> tp2+dp2` fan-in planning
+- fake-FSDP1 and fake-FSDP2 shard-native metadata paths
+- direct receive writeback into flat FSDP storage
+- negative coverage for unsupported FSDP layouts and accidental gather paths
 - end-to-end control-plane behavior for remote SGLang sync
 
 ## Who This Is For
@@ -338,6 +383,7 @@ RLite is for people who already know what RL loop they want, and do **not** want
 You will probably like this project if:
 
 - you want Megatron for training and SGLang for rollout
+- you want native `transformers` + FSDP without giving up explicit shard-local weight exchange
 - you care about zero-copy or near-zero-copy weight updates
 - you do not want to live on a permanent private fork of either framework
 - you are iterating on new RL algorithms faster than framework authors can expose knobs for them
@@ -348,6 +394,7 @@ RLite is early, but the direction is clear:
 
 - upstream-friendly framework integration
 - explicit transport and resharding semantics
+- one planner core shared across Megatron, SGLang, and native `transformers` + FSDP
 - minimal examples that prove the bridge works
 - enough systems structure to scale beyond a toy script, without turning into a giant framework
 
