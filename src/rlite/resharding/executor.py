@@ -13,6 +13,7 @@ from .types import (
     ExchangeResult,
     ExecutionSlice,
     FrameworkSnapshot,
+    PendingReceive,
     ParameterRecord,
     TensorBinding,
     TensorBindingManifest,
@@ -112,6 +113,18 @@ def _allocate_target_stage(record: ParameterRecord, manifest: TensorBindingManif
     return bytearray(manifest.num_bytes)
 
 
+def _allocate_owner_stage(record: ParameterRecord):
+    if _is_torch_tensor(record.tensor):
+        import torch
+
+        stage_buffer = torch.empty_like(record.tensor)
+        stage_buffer.copy_(record.tensor)
+        return stage_buffer
+    stage_buffer = bytearray(record.num_bytes)
+    _copy_into(stage_buffer, record.tensor)
+    return stage_buffer
+
+
 def _apply_target_stage(record: ParameterRecord, manifest: TensorBindingManifest, stage_buffer) -> None:
     if manifest.component_start == 0 and manifest.component_end == len(record.canonical_names):
         if record.transpose:
@@ -139,6 +152,18 @@ def _apply_target_stage(record: ParameterRecord, manifest: TensorBindingManifest
             length,
         )
         _copy_into(dst, stage_buffer)
+
+
+def _swap_torch_tensor_storage(dst, src) -> None:
+    storage = src.untyped_storage() if hasattr(src, "untyped_storage") else src.storage()
+    dst.set_(storage, src.storage_offset(), src.size(), src.stride())
+
+
+def _swap_target_record(record: ParameterRecord, stage_buffer) -> None:
+    if _is_torch_tensor(record.tensor):
+        _swap_torch_tensor_storage(record.tensor, stage_buffer)
+        return
+    _copy_into(record.tensor, stage_buffer)
 
 
 def _materialize_binding(
@@ -201,6 +226,160 @@ def _binding_map(
             as_target=manifest.binding_id in target_binding_ids,
         )
     return bindings
+
+
+def _owner_stage_supported(record: ParameterRecord) -> bool:
+    return not record.transpose and record.packing.axis in (None, 0)
+
+
+def _owner_stage_binding(record: ParameterRecord, manifest: TensorBindingManifest, stage_buffer) -> TensorBinding:
+    if manifest.component_start == 0 and manifest.component_end == len(record.canonical_names):
+        buffer = stage_buffer
+    else:
+        start = _component_axis_offset(record, manifest)
+        length = _component_axis_length(record, manifest)
+        buffer = _slice_bytes_for_axis0(stage_buffer, record.actual_shape, start, length)
+    return TensorBinding(
+        manifest=replace(
+            manifest,
+            binding_kind=BindingKind.STAGED,
+            metadata={**manifest.metadata, "stage_mode": "ping_pong"},
+        ),
+        buffer=buffer,
+    )
+
+
+def _prepare_receive_bindings(
+    snapshot: FrameworkSnapshot,
+    target_manifests: tuple[TensorBindingManifest, ...],
+) -> tuple[dict[str, TensorBinding], tuple[str, ...], tuple[callable, ...], tuple[callable, ...], int]:
+    records = snapshot.records_by_id()
+    manifests_by_record: dict[str, list[TensorBindingManifest]] = {}
+    for manifest in target_manifests:
+        manifests_by_record.setdefault(manifest.record_id, []).append(manifest)
+
+    bindings: dict[str, TensorBinding] = {}
+    prepared: list[str] = []
+    commit_actions = []
+    abort_actions = []
+    fallback_bytes = 0
+
+    for record_id, manifests in manifests_by_record.items():
+        record = records[record_id]
+        if any(manifest.binding_kind is BindingKind.STAGED for manifest in manifests) and _owner_stage_supported(record):
+            owner_stage = _allocate_owner_stage(record)
+            fallback_bytes += _buffer_num_bytes(owner_stage)
+            commit_actions.append(
+                lambda record=record, owner_stage=owner_stage: _swap_target_record(record, owner_stage)
+            )
+            for manifest in manifests:
+                binding = _owner_stage_binding(record, manifest, owner_stage)
+                bindings[manifest.binding_id] = binding
+        else:
+            for manifest in manifests:
+                binding = _materialize_binding(record, manifest, as_target=True)
+                if binding.prepare_fn is not None:
+                    binding.prepare_fn()
+                    prepared.append(binding.manifest.binding_id)
+                if binding.manifest.binding_kind is BindingKind.STAGED:
+                    fallback_bytes += _buffer_num_bytes(binding.buffer)
+                    if binding.apply_fn is not None:
+                        commit_actions.append(binding.apply_fn)
+                bindings[manifest.binding_id] = binding
+
+    return (
+        bindings,
+        tuple(prepared),
+        tuple(commit_actions),
+        tuple(abort_actions),
+        fallback_bytes,
+    )
+
+
+def prepare_receive(
+    local_snapshot: FrameworkSnapshot,
+    execution_slice: ExecutionSlice,
+    transport_session: TransportSession,
+) -> PendingReceive:
+    """Prepare target bindings and publish transport descriptors without executing sends."""
+
+    local_rank = local_snapshot.endpoint.rank
+    if int(execution_slice.rank) != int(local_rank):
+        raise ValueError(
+            f"Execution slice rank {execution_slice.rank} does not match local snapshot rank {local_rank}."
+        )
+
+    target_ids = set(execution_slice.target_binding_ids)
+    target_manifests = tuple(
+        manifest for manifest in execution_slice.binding_manifests if manifest.binding_id in target_ids
+    )
+    bindings, prepared, commit_actions, abort_actions, fallback_bytes = _prepare_receive_bindings(
+        local_snapshot,
+        target_manifests,
+    )
+    for binding in bindings.values():
+        transport_session.register_tensor(
+            binding.manifest.exchange_key,
+            binding.buffer,
+            memory_kind=binding.manifest.memory_kind,
+            dtype=binding.manifest.dtype,
+            shape=binding.manifest.local_shape,
+        )
+    descriptor = transport_session.publish_descriptors()
+    return PendingReceive(
+        rank=local_rank,
+        transport_session=transport_session,
+        rank_descriptor=descriptor,
+        bindings=bindings,
+        target_binding_ids=tuple(sorted(target_ids)),
+        prepared_binding_ids=prepared,
+        requires_staging=bool(fallback_bytes),
+        fallback_bytes=fallback_bytes,
+        metadata={
+            "requires_staging": "1" if fallback_bytes else "0",
+            "fallback_bytes": str(fallback_bytes),
+        },
+        commit_actions=commit_actions,
+        abort_actions=abort_actions,
+    )
+
+
+def commit_receive(pending: PendingReceive) -> ExchangeResult:
+    """Commit a previously prepared receive."""
+
+    if pending._finished:
+        raise RuntimeError(f"Pending receive on rank {pending.rank} is already finished.")
+    applied = []
+    for action in pending.commit_actions:
+        action()
+    if pending.commit_actions:
+        applied = list(pending.target_binding_ids)
+    if pending.close_on_finish:
+        pending.transport_session.close()
+    pending._finished = True
+    return ExchangeResult(
+        rank=pending.rank,
+        transport_result=None,
+        prepared_binding_ids=pending.prepared_binding_ids,
+        applied_binding_ids=tuple(applied),
+    )
+
+
+def abort_receive(pending: PendingReceive) -> ExchangeResult:
+    """Abort a previously prepared receive without applying staged state."""
+
+    if pending._finished:
+        raise RuntimeError(f"Pending receive on rank {pending.rank} is already finished.")
+    for action in pending.abort_actions:
+        action()
+    if pending.close_on_finish:
+        pending.transport_session.close()
+    pending._finished = True
+    return ExchangeResult(
+        rank=pending.rank,
+        transport_result=None,
+        prepared_binding_ids=pending.prepared_binding_ids,
+    )
 
 
 def execute_exchange_plan(

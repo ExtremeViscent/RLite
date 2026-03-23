@@ -513,6 +513,133 @@ def _choose_source_manifest(
     return best_source, best_decision, best_transfer_bytes
 
 
+def _subtract_interval(
+    uncovered: list[tuple[int, int]],
+    covered: tuple[int, int],
+) -> list[tuple[int, int]]:
+    covered_start, covered_stop = covered
+    remaining: list[tuple[int, int]] = []
+    for start, stop in uncovered:
+        if covered_stop <= start or stop <= covered_start:
+            remaining.append((start, stop))
+            continue
+        if start < covered_start:
+            remaining.append((start, covered_start))
+        if covered_stop < stop:
+            remaining.append((covered_stop, stop))
+    return remaining
+
+
+def _select_source_manifests(
+    sources: Sequence[TensorBindingManifest],
+    target: TensorBindingManifest,
+    source_load_bytes: Mapping[int, int],
+    source_endpoints: Mapping[int, WorkerEndpoint],
+    target_endpoints: Mapping[int, WorkerEndpoint],
+    policy: TopologyPolicy,
+) -> tuple[tuple[tuple[TensorBindingManifest, TopologyDecision, tuple[TransferTask, ...]], ...], int]:
+    if not sources:
+        raise ValueError(f"No source candidates available for {target.canonical_names!r}.")
+
+    axis = None
+    for source in sources:
+        axis = source.shard_axis if source.shard_axis is not None else target.shard_axis
+        if axis is not None:
+            break
+
+    if axis is None:
+        source, decision, _ = _choose_source_manifest(
+            sources,
+            target,
+            source_load_bytes,
+            source_endpoints,
+            target_endpoints,
+            policy,
+        )
+        tasks = _build_transfer_tasks(source, target, decision.preferred_path)
+        return (((source, decision, tasks),), sum(task.num_bytes for task in tasks))
+
+    target_slice = target.logical_slices[axis]
+    uncovered = [target_slice]
+    selected: list[tuple[TensorBindingManifest, TopologyDecision, tuple[TransferTask, ...], tuple[int, int]]] = []
+    remaining = list(sources)
+    total_bytes = 0
+
+    while uncovered:
+        best = None
+        best_score = None
+        best_bytes = 0
+        for source in remaining:
+            overlap = _overlap_on_axis(source, target, axis)
+            if overlap is None:
+                continue
+            overlap_start, overlap_stop = overlap
+            uncovered_bytes = sum(
+                max(0, min(stop, overlap_stop) - max(start, overlap_start))
+                for start, stop in uncovered
+            )
+            if uncovered_bytes <= 0:
+                continue
+
+            source_endpoint = source_endpoints[source.rank]
+            target_endpoint = target_endpoints[target.rank]
+            locality, preferred_path = _candidate_locality(
+                source,
+                target,
+                source_endpoint,
+                target_endpoint,
+                policy,
+            )
+            tasks = _build_transfer_tasks(source, target, preferred_path)
+            transfer_bytes = sum(task.num_bytes for task in tasks)
+            if transfer_bytes <= 0:
+                continue
+            score = (
+                *_locality_score(
+                    locality,
+                    transfer_bytes,
+                    source_load_bytes.get(source.rank, 0),
+                    source_endpoint,
+                    target_endpoint,
+                    policy,
+                ),
+                -uncovered_bytes,
+            )
+            decision = TopologyDecision(
+                src_rank=source.rank,
+                dst_rank=target.rank,
+                locality_tier=locality,
+                preferred_path=preferred_path,
+                source_nic_name=(source_endpoint.nic_names[0] if source_endpoint.nic_names else ""),
+                target_nic_name=(target_endpoint.nic_names[0] if target_endpoint.nic_names else ""),
+                source_provider_name=(
+                    source_endpoint.provider_names[0] if source_endpoint.provider_names else ""
+                ),
+                target_provider_name=(
+                    target_endpoint.provider_names[0] if target_endpoint.provider_names else ""
+                ),
+            )
+            if best_score is None or score < best_score:
+                best = (source, decision, tasks, overlap)
+                best_score = score
+                best_bytes = transfer_bytes
+
+        if best is None:
+            raise ValueError(
+                f"Could not cover target logical slice {target_slice} for {target.canonical_names!r} "
+                f"with source candidates on rank {target.rank}."
+            )
+        selected.append(best)
+        remaining = [source for source in remaining if source.binding_id != best[0].binding_id]
+        uncovered = _subtract_interval(uncovered, best[3])
+        total_bytes += best_bytes
+
+    return (
+        tuple((source, decision, tasks) for source, decision, tasks, _ in selected),
+        total_bytes,
+    )
+
+
 def _overlap_on_axis(
     source: TensorBindingManifest,
     target: TensorBindingManifest,
@@ -701,7 +828,7 @@ def build_exchange_plan(
         )
 
         for target in target_candidates:
-            source, decision, transfer_bytes = _choose_source_manifest(
+            selections, transfer_bytes = _select_source_manifests(
                 source_candidates,
                 target,
                 source_load_bytes,
@@ -709,18 +836,20 @@ def build_exchange_plan(
                 target_endpoints,
                 policy=policy,
             )
-            tasks = _build_transfer_tasks(source, target, decision.preferred_path)
-            source_load_bytes[source.rank] += sum(task.num_bytes for task in tasks)
-            topology_decisions[(source.rank, target.rank)] = decision
-            manifests_by_rank[source.rank].append(source)
             manifests_by_rank[target.rank].append(target)
             target_binding_ids_by_rank[target.rank].append(target.binding_id)
-            if source.rank != target.rank:
-                expected_sources_by_rank[target.rank].add(source.rank)
-            send_tasks_by_rank[source.rank].extend(tasks)
+            for source, decision, tasks in selections:
+                source_load_bytes[source.rank] += sum(task.num_bytes for task in tasks)
+                topology_decisions[(source.rank, target.rank)] = decision
+                manifests_by_rank[source.rank].append(source)
+                if source.rank != target.rank:
+                    expected_sources_by_rank[target.rank].add(source.rank)
+                send_tasks_by_rank[source.rank].extend(tasks)
 
     execution_slices: dict[int, ExecutionSlice] = {}
     all_ranks = set(manifests_by_rank)
+    plan_requires_staging = False
+    plan_fallback_bytes = 0
     for rank in all_ranks:
         rank_endpoint = source_endpoints.get(rank) or target_endpoints.get(rank)
         nic_name = ""
@@ -743,14 +872,28 @@ def build_exchange_plan(
                 )
             )
         manifests = tuple({manifest.binding_id: manifest for manifest in manifests_by_rank[rank]}.values())
+        target_binding_ids = tuple(target_binding_ids_by_rank.get(rank, ()))
+        staged_target_manifests = tuple(
+            manifest
+            for manifest in manifests
+            if manifest.binding_id in target_binding_ids and manifest.binding_kind is BindingKind.STAGED
+        )
+        requires_staging = bool(staged_target_manifests)
+        fallback_bytes = sum(manifest.num_bytes for manifest in staged_target_manifests)
+        plan_requires_staging = plan_requires_staging or requires_staging
+        plan_fallback_bytes += fallback_bytes
         execution_slices[rank] = ExecutionSlice(
             rank=rank,
             binding_manifests=manifests,
             send_tasks=tuple(send_tasks_by_rank.get(rank, ())),
-            target_binding_ids=tuple(target_binding_ids_by_rank.get(rank, ())),
+            target_binding_ids=target_binding_ids,
             expected_source_ranks=tuple(expected_sources_by_rank.get(rank, ())),
             selected_nic_name=nic_name,
             selected_provider_name=provider_name,
+            metadata={
+                "requires_staging": "1" if requires_staging else "0",
+                "fallback_bytes": str(fallback_bytes),
+            },
         )
 
     return ExchangePlan(
@@ -760,4 +903,8 @@ def build_exchange_plan(
         binding_manifests_by_rank={rank: slice_.binding_manifests for rank, slice_ in execution_slices.items()},
         execution_slices=execution_slices,
         topology_decisions=topology_decisions,
+        metadata={
+            "requires_staging": "1" if plan_requires_staging else "0",
+            "fallback_bytes": str(plan_fallback_bytes),
+        },
     )

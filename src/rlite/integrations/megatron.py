@@ -13,14 +13,20 @@ from rlite.weight_mapping import Framework, resolve_rule, translate_tensor
 from ..resharding import (
     FrameworkRole,
     FrameworkSnapshot,
+    PendingReceive,
     ParameterRecord,
     TopologyPolicy,
     WorkerEndpoint,
+    abort_receive,
     build_exchange_plan,
+    commit_receive,
     execute_exchange_plan,
     normalize_expert_canonical_names,
+    prepare_receive,
     split_grouped_expert_record,
 )
+
+_PENDING_MEGATRON_RECEIVES: dict[str, PendingReceive] = {}
 
 
 def _group_ranks(group) -> tuple[int, ...]:
@@ -74,7 +80,8 @@ def _make_endpoint(
     provider_names: Iterable[str] = (),
 ) -> WorkerEndpoint:
     pg_collection = getattr(model, "pg_collection", None)
-    rank = _infer_distributed_rank(model, 0) + int(rank_offset)
+    base_rank = _infer_distributed_rank(model, 0)
+    rank = base_rank + int(rank_offset)
     parameter = _first_parameter(model)
     device_id = None
     if parameter is not None:
@@ -99,15 +106,15 @@ def _make_endpoint(
         device_id=device_id,
         nic_names=tuple(nic_names),
         provider_names=tuple(provider_names),
-        tensor_parallel_rank=_rank_in_group(rank, tp_ranks),
+        tensor_parallel_rank=_rank_in_group(base_rank, tp_ranks),
         tensor_parallel_size=max(1, len(tp_ranks) or 1),
-        expert_parallel_rank=_rank_in_group(rank, ep_ranks),
+        expert_parallel_rank=_rank_in_group(base_rank, ep_ranks),
         expert_parallel_size=max(1, len(ep_ranks) or 1),
-        moe_tensor_parallel_rank=_rank_in_group(rank, expt_tp_ranks or tp_ranks),
+        moe_tensor_parallel_rank=_rank_in_group(base_rank, expt_tp_ranks or tp_ranks),
         moe_tensor_parallel_size=max(1, len(expt_tp_ranks or tp_ranks) or 1),
-        pipeline_parallel_rank=_rank_in_group(rank, pp_ranks),
+        pipeline_parallel_rank=_rank_in_group(base_rank, pp_ranks),
         pipeline_parallel_size=max(1, len(pp_ranks) or 1),
-        data_parallel_rank=_rank_in_group(rank, dp_ranks),
+        data_parallel_rank=_rank_in_group(base_rank, dp_ranks),
         data_parallel_size=max(1, len(dp_ranks) or 1),
     )
 
@@ -222,3 +229,55 @@ def execute_megatron_exchange(
         provider_name=execution_slice.selected_provider_name,
     )
     return execute_exchange_plan(snapshot, execution_slice, coordinator, session)
+
+
+def prepare_megatron_receive(
+    model,
+    profile,
+    execution_slice,
+    *,
+    transport_session: Optional[TransportSession] = None,
+    rank_offset: int = 0,
+    host: str | None = None,
+    nic_names: Iterable[str] = (),
+    provider_names: Iterable[str] = (),
+) -> PendingReceive:
+    """Prepare a Megatron model to receive remotely copied weights."""
+
+    snapshot = collect_megatron_snapshot(
+        model,
+        profile,
+        role=FrameworkRole.TARGET,
+        rank_offset=rank_offset,
+        host=host,
+        nic_names=nic_names,
+        provider_names=provider_names,
+    )
+    session = transport_session or TransportSession(
+        rank=snapshot.endpoint.rank,
+        world_size=_world_size_for_execution_slice(execution_slice, snapshot.endpoint.rank),
+        host=snapshot.endpoint.host,
+        nic_name=execution_slice.selected_nic_name,
+        provider_name=execution_slice.selected_provider_name,
+    )
+    return prepare_receive(snapshot, execution_slice, session)
+
+
+def commit_megatron_receive(pending: PendingReceive):
+    return commit_receive(pending)
+
+
+def abort_megatron_receive(pending: PendingReceive):
+    return abort_receive(pending)
+
+
+def store_pending_megatron_receive(request_id: str, pending: PendingReceive) -> None:
+    _PENDING_MEGATRON_RECEIVES[str(request_id)] = pending
+
+
+def commit_pending_megatron_receive(request_id: str):
+    return commit_megatron_receive(_PENDING_MEGATRON_RECEIVES.pop(str(request_id)))
+
+
+def abort_pending_megatron_receive(request_id: str):
+    return abort_megatron_receive(_PENDING_MEGATRON_RECEIVES.pop(str(request_id)))

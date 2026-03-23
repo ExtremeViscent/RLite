@@ -75,6 +75,7 @@ def _record(
     component_local_sizes: tuple[int, ...] = (),
     memory_kind: MemoryKind = MemoryKind.CPU,
     dtype: str = "uint8",
+    reshape: tuple[int, ...] | None = None,
 ) -> ParameterRecord:
     local_shape = local_shape or logical_shape
     num_bytes = _shape_product(local_shape)
@@ -93,6 +94,7 @@ def _record(
         memory_kind=memory_kind,
         component_logical_sizes=component_logical_sizes,
         component_local_sizes=component_local_sizes,
+        reshape=reshape,
     )
 
 
@@ -272,3 +274,86 @@ def test_planner_prefers_same_host_path_over_cross_host_rdma() -> None:
     decision = plan.topology_decisions[(0, 10)]
     assert decision.locality_tier is LocalityTier.SAME_HOST_DIRECT
     assert decision.preferred_path is TransferPath.MEMCPY
+
+
+def test_planner_surfaces_staging_metadata() -> None:
+    source = _snapshot(
+        _endpoint(0, framework="megatron", role=FrameworkRole.SOURCE),
+        _record("src.weight", canonical_names=("layer.weight",), logical_shape=(8,)),
+    )
+    target = _snapshot(
+        _endpoint(4, framework="sglang", role=FrameworkRole.TARGET),
+        _record(
+            "dst.weight",
+            canonical_names=("layer.weight",),
+            logical_shape=(8,),
+            reshape=(8,),
+        ),
+    )
+
+    plan = build_exchange_plan(source, target)
+
+    assert plan.metadata["requires_staging"] == "1"
+    assert plan.metadata["fallback_bytes"] == "8"
+    assert plan.execution_slices[4].metadata["requires_staging"] == "1"
+    assert plan.execution_slices[4].metadata["fallback_bytes"] == "8"
+
+
+def test_planner_tp4_to_tp2_dp2_keeps_dp_replicas_independent() -> None:
+    source_snapshots = tuple(
+        _snapshot(
+            _endpoint(
+                rank,
+                framework="megatron",
+                role=FrameworkRole.SOURCE,
+                tp_rank=rank,
+                tp_size=4,
+            ),
+            _record(
+                f"src.weight.rank{rank}",
+                canonical_names=("layer.0.out",),
+                logical_shape=(8,),
+                local_shape=(2,),
+                parallel=PAR_TP_COL,
+            ),
+        )
+        for rank in range(4)
+    )
+    target_specs = (
+        (4, 0, 0),
+        (5, 1, 0),
+        (6, 0, 1),
+        (7, 1, 1),
+    )
+    target_snapshots = tuple(
+        _snapshot(
+            _endpoint(
+                rank,
+                framework="sglang",
+                role=FrameworkRole.TARGET,
+                tp_rank=tp_rank,
+                tp_size=2,
+                dp_rank=dp_rank,
+                dp_size=2,
+            ),
+            _record(
+                f"dst.weight.rank{rank}",
+                canonical_names=("layer.0.out",),
+                logical_shape=(8,),
+                local_shape=(4,),
+                parallel=PAR_TP_COL,
+            ),
+        )
+        for rank, tp_rank, dp_rank in target_specs
+    )
+
+    plan = build_exchange_plan(source_snapshots, target_snapshots)
+
+    assert plan.execution_slices[4].expected_source_ranks == (0, 1)
+    assert plan.execution_slices[5].expected_source_ranks == (2, 3)
+    assert plan.execution_slices[6].expected_source_ranks == (0, 1)
+    assert plan.execution_slices[7].expected_source_ranks == (2, 3)
+    assert sum(task.num_bytes for task in plan.execution_slices[0].send_tasks) == 4
+    assert sum(task.num_bytes for task in plan.execution_slices[1].send_tasks) == 4
+    assert sum(task.num_bytes for task in plan.execution_slices[2].send_tasks) == 4
+    assert sum(task.num_bytes for task in plan.execution_slices[3].send_tasks) == 4

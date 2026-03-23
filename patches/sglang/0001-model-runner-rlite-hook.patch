@@ -1,8 +1,8 @@
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 62079dacf..23f673b89 100644
+index 62079dacf..b5c680a16 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -1573,6 +1573,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -1573,6 +1573,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
              return self._update_weights_from_flattened_bucket(
                  flattened_tensor_bucket_dict=named_tensors
              )
@@ -10,6 +10,18 @@ index 62079dacf..23f673b89 100644
 +            from rlite.integrations.sglang import apply_sglang_rlite_update
 +
 +            return apply_sglang_rlite_update(self, named_tensors)
++        if load_format == "rlite_prepare_receive":
++            from rlite.integrations.sglang import prepare_sglang_rlite_receive
++
++            return prepare_sglang_rlite_receive(self, named_tensors)
++        if load_format == "rlite_commit_receive":
++            from rlite.integrations.sglang import commit_sglang_rlite_receive
++
++            return commit_sglang_rlite_receive(named_tensors)
++        if load_format == "rlite_abort_receive":
++            from rlite.integrations.sglang import abort_sglang_rlite_receive
++
++            return abort_sglang_rlite_receive(named_tensors)
  
          # We need to get device after patch otherwise the device would be wrong
          self.device_module = torch.get_device_module(self.device)

@@ -1,0 +1,130 @@
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index acf60ccfe..0e7028c65 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -164,6 +164,7 @@
+ from sglang.srt.parser.reasoning_parser import ReasoningParser
+ from sglang.srt.server_args import PortArgs, ServerArgs
+ from sglang.srt.utils import (
++    MultiprocessingSerializer,
+     add_prometheus_middleware,
+     add_prometheus_track_response_middleware,
+     delete_directory,
+@@ -217,6 +218,25 @@
+     return _global_state
+ 
+ 
++def _make_rlite_update_request(payload, *, load_format: str, flush_cache: bool):
++    serialized_payload = MultiprocessingSerializer.serialize(
++        [("__rlite_payload__", payload)],
++        output_str=True,
++    )
++    tp_size = int(getattr(_global_state.tokenizer_manager.server_args, "tp_size", 1) or 1)
++    return UpdateWeightsFromTensorReqInput(
++        serialized_named_tensors=[serialized_payload for _ in range(tp_size)],
++        load_format=load_format,
++        flush_cache=flush_cache,
++    )
++
++
++def _decode_rlite_messages(message: str):
++    from rlite.integrations import decode_payload
++
++    return [decode_payload(part) for part in message.split(" | ") if part]
++
++
+ async def init_multi_tokenizer() -> ServerArgs:
+     """
+     Initialization function for multi-process tokenizer mode.
+@@ -1099,6 +1119,91 @@
+     return ORJSONResponse(
+         content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+     )
++
++
++@app.post("/rlite/prepare_receive")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def rlite_prepare_receive(obj: Dict[str, str], request: Request):
++    from rlite.integrations import decode_payload, encode_payload
++
++    payload = decode_payload(obj["payload_b64"])
++    req = _make_rlite_update_request(
++        payload,
++        load_format="rlite_prepare_receive",
++        flush_cache=False,
++    )
++    success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
++        req, request
++    )
++    if not success:
++        return ORJSONResponse(
++            {"success": False, "message": message},
++            status_code=HTTPStatus.BAD_REQUEST,
++        )
++    worker_payloads = _decode_rlite_messages(message)
++    result_payload = {
++        "rank_descriptors": {
++            int(item["rank"]): item["rank_descriptor"] for item in worker_payloads
++        },
++        "requires_staging": any(bool(item.get("requires_staging", False)) for item in worker_payloads),
++        "fallback_bytes": sum(int(item.get("fallback_bytes", 0)) for item in worker_payloads),
++    }
++    return ORJSONResponse(
++        {
++            "success": True,
++            "payload_b64": encode_payload(result_payload),
++            "requires_staging": result_payload["requires_staging"],
++            "fallback_bytes": result_payload["fallback_bytes"],
++        }
++    )
++
++
++@app.post("/rlite/commit_receive")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def rlite_commit_receive(obj: Dict[str, str], request: Request):
++    from rlite.integrations import decode_payload, encode_payload
++
++    payload = decode_payload(obj["payload_b64"])
++    req = _make_rlite_update_request(
++        payload,
++        load_format="rlite_commit_receive",
++        flush_cache=True,
++    )
++    success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
++        req, request
++    )
++    content = {"success": success}
++    if success:
++        content["payload_b64"] = encode_payload(_decode_rlite_messages(message))
++    else:
++        content["message"] = message
++    return ORJSONResponse(
++        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
++    )
++
++
++@app.post("/rlite/abort_receive")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def rlite_abort_receive(obj: Dict[str, str], request: Request):
++    from rlite.integrations import decode_payload, encode_payload
++
++    payload = decode_payload(obj["payload_b64"])
++    req = _make_rlite_update_request(
++        payload,
++        load_format="rlite_abort_receive",
++        flush_cache=False,
++    )
++    success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
++        req, request
++    )
++    content = {"success": success}
++    if success:
++        content["payload_b64"] = encode_payload(_decode_rlite_messages(message))
++    else:
++        content["message"] = message
++    return ORJSONResponse(
++        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
++    )
+ 
+ 
+ @app.post("/update_weights_from_distributed")

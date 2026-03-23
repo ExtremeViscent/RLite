@@ -226,3 +226,27 @@ def test_invalid_view_raises_value_error() -> None:
             profile,
             view="wrong",
         )
+
+
+@pytest.mark.parametrize(
+    ("family", "variant", "source_framework", "target_framework", "key"),
+    [
+        ("qwen", "qwen2_5", Framework.MEGATRON, Framework.SGLANG, "decoder.layers.0.self_attention.linear_qkv.weight"),
+        ("glm", "glm4", Framework.TRANSFORMERS, Framework.MEGATRON, "model.layers.0.self_attn.q_proj.weight"),
+        ("llama", "llama3", Framework.TRANSFORMERS, Framework.MEGATRON, "model.layers.0.self_attn.q_proj.weight"),
+        ("gpt", "gpt_dense", Framework.TRANSFORMERS, Framework.MEGATRON, "transformer.h.0.attn.c_attn.weight"),
+        ("deepseek", "deepseek_v3", Framework.SGLANG, Framework.MEGATRON, "model.layers.0.self_attn.fused_qkv_a_proj_with_mqa.weight"),
+    ],
+)
+def test_sample_keys_translate_across_supported_families(
+    family: str,
+    variant: str,
+    source_framework: Framework,
+    target_framework: Framework,
+    key: str,
+) -> None:
+    profile = get_profile(family, variant)
+
+    translated = translate_key(key, source_framework, target_framework, profile)
+
+    assert translated

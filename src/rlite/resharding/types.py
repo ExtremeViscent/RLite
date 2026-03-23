@@ -397,3 +397,29 @@ class ExchangeResult:
         object.__setattr__(self, "prepared_binding_ids", tuple(self.prepared_binding_ids))
         object.__setattr__(self, "applied_binding_ids", tuple(self.applied_binding_ids))
         object.__setattr__(self, "warnings", tuple(str(value) for value in self.warnings))
+
+
+@dataclass
+class PendingReceive:
+    """Prepared receive state that can later be committed or aborted."""
+
+    rank: int
+    transport_session: Any
+    rank_descriptor: RankDescriptor
+    bindings: Mapping[str, TensorBinding]
+    target_binding_ids: tuple[str, ...]
+    prepared_binding_ids: tuple[str, ...] = ()
+    requires_staging: bool = False
+    fallback_bytes: int = 0
+    metadata: Mapping[str, str] = field(default_factory=dict)
+    commit_actions: tuple[Callable[[], None], ...] = ()
+    abort_actions: tuple[Callable[[], None], ...] = ()
+    close_on_finish: bool = True
+    _finished: bool = field(default=False, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.target_binding_ids = tuple(self.target_binding_ids)
+        self.prepared_binding_ids = tuple(self.prepared_binding_ids)
+        self.metadata = dict(self.metadata)
+        self.commit_actions = tuple(self.commit_actions)
+        self.abort_actions = tuple(self.abort_actions)

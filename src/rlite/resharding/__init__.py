@@ -1,7 +1,13 @@
 """Public exports for topology-aware weight exchange planning."""
 
 from .coordinator import FrozenExchangeCoordinator, InMemoryExchangeCoordinator
-from .executor import execute_exchange_plan, frozen_coordinator_from_payload
+from .executor import (
+    abort_receive,
+    commit_receive,
+    execute_exchange_plan,
+    frozen_coordinator_from_payload,
+    prepare_receive,
+)
 from .planner import (
     build_binding_manifest,
     build_exchange_plan,
@@ -18,6 +24,7 @@ from .types import (
     FrameworkSnapshot,
     LocalityTier,
     ParameterRecord,
+    PendingReceive,
     TensorBinding,
     TensorBindingManifest,
     TopologyDecision,
@@ -49,6 +56,7 @@ __all__ = [
     "InMemoryExchangeCoordinator",
     "LocalityTier",
     "ParameterRecord",
+    "PendingReceive",
     "TensorBinding",
     "TensorBindingManifest",
     "TopologyDecision",
@@ -58,8 +66,11 @@ __all__ = [
     "build_exchange_plan",
     "collect_megatron_snapshot",
     "collect_sglang_snapshot",
+    "commit_receive",
     "execute_exchange_plan",
     "frozen_coordinator_from_payload",
     "normalize_expert_canonical_names",
+    "prepare_receive",
     "split_grouped_expert_record",
+    "abort_receive",
 ]
