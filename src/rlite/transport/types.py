@@ -49,12 +49,16 @@ class TransferPath(str, Enum):
 def _normalize_memory_kind(value: MemoryKind | str) -> MemoryKind:
     if isinstance(value, MemoryKind):
         return value
+    if isinstance(value, Enum):
+        value = value.value
     return MemoryKind(str(value).lower())
 
 
 def _normalize_transfer_path(value: TransferPath | str) -> TransferPath:
     if isinstance(value, TransferPath):
         return value
+    if isinstance(value, Enum):
+        value = value.value
     return TransferPath(str(value).lower())
 
 

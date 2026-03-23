@@ -23,6 +23,7 @@ from .types import (
     TransferPlan,
     TransportResult,
     buffer_address_from_view,
+    _normalize_memory_kind,
 )
 
 if TYPE_CHECKING:
@@ -36,7 +37,7 @@ def _stable_key(rank: int, tensor_name: str) -> int:
 
 def _infer_memory_kind(buffer: Any, explicit: Optional[MemoryKind | str]) -> MemoryKind:
     if explicit is not None:
-        return explicit if isinstance(explicit, MemoryKind) else MemoryKind(str(explicit).lower())
+        return _normalize_memory_kind(explicit)
     device = getattr(buffer, "device", None)
     if device is not None and str(device).startswith("cuda"):
         return MemoryKind.CUDA

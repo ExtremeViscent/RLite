@@ -1,0 +1,15 @@
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 62079dacf..23f673b89 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -1573,6 +1573,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             return self._update_weights_from_flattened_bucket(
+                 flattened_tensor_bucket_dict=named_tensors
+             )
++        if load_format == "rlite":
++            from rlite.integrations.sglang import apply_sglang_rlite_update
++
++            return apply_sglang_rlite_update(self, named_tensors)
+ 
+         # We need to get device after patch otherwise the device would be wrong
+         self.device_module = torch.get_device_module(self.device)

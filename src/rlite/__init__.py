@@ -1,5 +1,5 @@
 """RLite public package."""
 
-from . import transport, weight_mapping
+from . import integrations, resharding, transport, weight_mapping
 
-__all__ = ["transport", "weight_mapping"]
+__all__ = ["integrations", "resharding", "transport", "weight_mapping"]

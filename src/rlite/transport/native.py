@@ -18,6 +18,8 @@ from .types import (
     TransferPath,
     TransferPlan,
     TransportResult,
+    _normalize_memory_kind,
+    _normalize_transfer_path,
 )
 
 
@@ -60,7 +62,7 @@ def _decode_bytes(value: bytes) -> str:
 
 
 def _memory_kind_to_native(value: MemoryKind | str) -> int:
-    normalized = value if isinstance(value, MemoryKind) else MemoryKind(str(value).lower())
+    normalized = _normalize_memory_kind(value)
     return _MEMORY_KIND_TO_NATIVE[normalized]
 
 
@@ -71,7 +73,7 @@ def _memory_kind_from_native(value: int) -> MemoryKind:
 def _transfer_path_to_native(value: TransferPath | str | None) -> int:
     if value is None:
         return _TRANSFER_PATH_TO_NATIVE[TransferPath.UNAVAILABLE]
-    normalized = value if isinstance(value, TransferPath) else TransferPath(str(value).lower())
+    normalized = _normalize_transfer_path(value)
     return _TRANSFER_PATH_TO_NATIVE[normalized]
 
 
